@@ -1,0 +1,41 @@
+# Executables
+main
+train
+*.exe
+*.out
+*.app
+
+# Object files
+*.o
+*.obj
+*.ko
+
+# Libraries
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+
+# Build directories
+build/
+dist/
+cmake-build-debug/
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# OS files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# Debug files
+*.pdb
+*.ilk
