@@ -167,20 +167,19 @@ typedef struct {
 /*
  * TransformerBlock - A single decoder layer.
  *
- *  Uses pre-normalization architecture (LayerNorm before each sub-layer)
- *  which improves training stability compared to post-norm.
+ *  Standard pre-normalization architecture (LayerNorm before each sub-layer):
  *
  *  Flow:
  *      x -> LayerNorm_attn -> Self-Attention -> x + attn_out
  *         -> LayerNorm_ff  -> Feed-Forward   -> x + ff_out
- *         -> LayerNorm_final -> normalized output
+ *
+ *  No extra LayerNorm after the residual — that is handled at the model level.
  */
 typedef struct {
     MultiHeadAttention self_attention;  /* Masked self-attention sub-layer */
     FeedForward feed_forward;           /* Position-wise FFN sub-layer     */
     LayerNorm layer_norm_attn;          /* Pre-attention normalization     */
     LayerNorm layer_norm_ff;            /* Pre-FFN normalization           */
-    LayerNorm layer_norm_final;         /* Final normalization after block */
     int d_model;                        /* Model embedding dimension        */
 } TransformerBlock;
 
@@ -883,7 +882,6 @@ void transformer_block_init(TransformerBlock *block, int d_model, int num_heads,
     feedforward_init(&block->feed_forward, d_model, d_ff);
     layernorm_init(&block->layer_norm_attn, d_model);
     layernorm_init(&block->layer_norm_ff, d_model);
-    layernorm_init(&block->layer_norm_final, d_model);
 }
 
 void transformer_block_free(TransformerBlock *block) {
@@ -891,7 +889,6 @@ void transformer_block_free(TransformerBlock *block) {
     feedforward_free(&block->feed_forward);
     layernorm_free(&block->layer_norm_attn);
     layernorm_free(&block->layer_norm_ff);
-    layernorm_free(&block->layer_norm_final);
 }
 
 void transformer_block_forward(
@@ -938,12 +935,6 @@ void transformer_block_forward(
     for (int i = 0; i < vector_size; i++) {
         output[i] = output[i] + feed_forward_output[i];
     }
-
-    /* --- Final normalization --- */
-    for (int pos = 0; pos < sequence_length; pos++) {
-        layernorm_forward(&block->layer_norm_final, &output[pos * d_model], &normalized[pos * d_model], d_model);
-    }
-    memcpy(output, normalized, vector_size * sizeof(float));
 
     /* Free temporary buffers */
     free(normalized);

@@ -132,7 +132,7 @@ int main(void) {
         D_MODEL,
         1
     );
-    print_matrix(attention_output, sequence_length, D_MODEL, "Single Head Attention", word_labels);
+    print_matrix(attention_output, sequence_length, D_MODEL, "After Multi-Head Attention (4 heads)", word_labels);
 
     float *ff_input = (float *)malloc(sequence_length * D_MODEL * sizeof(float));
     for (int pos = 0; pos < sequence_length; pos++) {

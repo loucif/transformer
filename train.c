@@ -95,7 +95,6 @@ typedef struct {
     FeedForwardGrads feed_forward;
     LayerNormGrads layer_norm_attn;
     LayerNormGrads layer_norm_ff;
-    LayerNormGrads layer_norm_final;
 } TransformerBlockGrads;
 
 typedef struct {
@@ -181,7 +180,6 @@ void grad_init_block(TransformerBlockGrads *grad, int d_model, int num_heads, in
     grad_init_ffn(&grad->feed_forward, d_model, d_ff);
     grad_init_layernorm(&grad->layer_norm_attn, d_model);
     grad_init_layernorm(&grad->layer_norm_ff, d_model);
-    grad_init_layernorm(&grad->layer_norm_final, d_model);
 }
 
 void grad_zero_block(TransformerBlockGrads *grad) {
@@ -189,7 +187,6 @@ void grad_zero_block(TransformerBlockGrads *grad) {
     grad_zero_ffn(&grad->feed_forward);
     grad_zero_layernorm(&grad->layer_norm_attn);
     grad_zero_layernorm(&grad->layer_norm_ff);
-    grad_zero_layernorm(&grad->layer_norm_final);
 }
 
 void grad_init_model(TransformerGrads *grad, TransformerConfig config) {
@@ -234,8 +231,6 @@ void grad_free_model(TransformerGrads *grad, TransformerConfig config) {
         free(grad->blocks[l].layer_norm_attn.beta);
         free(grad->blocks[l].layer_norm_ff.gamma);
         free(grad->blocks[l].layer_norm_ff.beta);
-        free(grad->blocks[l].layer_norm_final.gamma);
-        free(grad->blocks[l].layer_norm_final.beta);
     }
     free(grad->blocks);
     matrix_free(&grad->final_ln_gamma);
@@ -284,7 +279,6 @@ void sgd_update_block(TransformerBlock *param, const TransformerBlockGrads *grad
     sgd_update_ffn(&param->feed_forward, &grad->feed_forward, lr);
     sgd_update_layernorm(&param->layer_norm_attn, &grad->layer_norm_attn, lr);
     sgd_update_layernorm(&param->layer_norm_ff, &grad->layer_norm_ff, lr);
-    sgd_update_layernorm(&param->layer_norm_final, &grad->layer_norm_final, lr);
 }
 
 void sgd_step(Transformer *model, const TransformerGrads *grads, float lr, TransformerConfig config) {
@@ -699,13 +693,12 @@ void transformer_block_backward(
     int d_model = block->d_model;
     int vector_size = sequence_length * d_model;
 
-    /* Recompute forward pass intermediates */
+    /* Recompute forward pass: after_attn stays as pre-FFN value (input to LN_ff) */
     float *normed1 = (float *)malloc(vector_size * sizeof(float));
     float *attn_out = (float *)malloc(vector_size * sizeof(float));
     float *after_attn = (float *)malloc(vector_size * sizeof(float));
     float *normed2 = (float *)malloc(vector_size * sizeof(float));
     float *ff_out = (float *)malloc(vector_size * sizeof(float));
-    float *normed3 = (float *)malloc(vector_size * sizeof(float));
 
     for (int pos = 0; pos < sequence_length; pos++) {
         layernorm_forward(&block->layer_norm_attn, &input[pos * d_model], &normed1[pos * d_model], d_model);
@@ -716,42 +709,33 @@ void transformer_block_backward(
         layernorm_forward(&block->layer_norm_ff, &after_attn[pos * d_model], &normed2[pos * d_model], d_model);
     }
     feedforward_forward(&block->feed_forward, normed2, ff_out, sequence_length);
-    for (int i = 0; i < vector_size; i++) after_attn[i] = after_attn[i] + ff_out[i];
-    for (int pos = 0; pos < sequence_length; pos++) {
-        layernorm_forward(&block->layer_norm_final, &after_attn[pos * d_model], &normed3[pos * d_model], d_model);
-    }
 
-    /* Backward through final layernorm */
-    float *d_after_ff = (float *)calloc(vector_size, sizeof(float));
-    for (int pos = 0; pos < sequence_length; pos++) {
-        layernorm_backward(&block->layer_norm_final, &after_attn[pos * d_model], &d_output[pos * d_model], &d_after_ff[pos * d_model], &grads->layer_norm_final, d_model);
-    }
+    /* ---- Backward ---- */
 
-    /* d_input accumulates from residual connections */
-    float *d_attn_out = (float *)calloc(vector_size, sizeof(float));
-    float *d_ff_out = (float *)calloc(vector_size, sizeof(float));
-
-    /* Backward through FFN residual: d_after_attn = d_after_ff, d_ff_out = d_after_ff */
+    /* Split at FFN residual: d_after_attn = d_output (residual), d_ff_out = d_output (into FFN) */
     float *d_after_attn = (float *)calloc(vector_size, sizeof(float));
+    float *d_ff_out = (float *)calloc(vector_size, sizeof(float));
     for (int i = 0; i < vector_size; i++) {
-        d_after_attn[i] = d_after_ff[i];
-        d_ff_out[i] = d_after_ff[i];
+        d_after_attn[i] = d_output[i];
+        d_ff_out[i] = d_output[i];
     }
 
     /* Backward through FFN */
     float *d_normed2 = (float *)calloc(vector_size, sizeof(float));
     feedforward_backward(&block->feed_forward, normed2, d_ff_out, d_normed2, &grads->feed_forward, sequence_length);
 
-    /* Backward through layernorm_ff */
+    /* Backward through layernorm_ff (after_attn is the saved pre-FFN value) */
     float *d_after_attn_ln = (float *)calloc(vector_size, sizeof(float));
     for (int pos = 0; pos < sequence_length; pos++) {
         layernorm_backward(&block->layer_norm_ff, &after_attn[pos * d_model], &d_normed2[pos * d_model], &d_after_attn_ln[pos * d_model], &grads->layer_norm_ff, d_model);
     }
     for (int i = 0; i < vector_size; i++) d_after_attn[i] += d_after_attn_ln[i];
 
-    /* Backward through attention residual: d_input += d_after_attn, d_attn_out = d_after_attn */
+    /* Split at attention residual: d_attn_out gets gradient into attention */
+    float *d_attn_out = (float *)calloc(vector_size, sizeof(float));
+    float *d_input_residual = (float *)calloc(vector_size, sizeof(float));
     for (int i = 0; i < vector_size; i++) {
-        d_input[i] = d_after_attn[i];
+        d_input_residual[i] = d_after_attn[i];
         d_attn_out[i] = d_after_attn[i];
     }
 
@@ -759,15 +743,17 @@ void transformer_block_backward(
     float *d_normed1 = (float *)calloc(vector_size, sizeof(float));
     multihead_attention_backward(&block->self_attention, normed1, d_attn_out, d_normed1, &grads->self_attention, sequence_length, d_model, use_causal_mask);
 
-    /* Backward through layernorm_attn */
+    /* Backward through layernorm_attn into separate buffer, then merge with residual */
+    float *d_input_ln = (float *)calloc(vector_size, sizeof(float));
     for (int pos = 0; pos < sequence_length; pos++) {
-        layernorm_backward(&block->layer_norm_attn, &input[pos * d_model], &d_normed1[pos * d_model], &d_input[pos * d_model], &grads->layer_norm_attn, d_model);
+        layernorm_backward(&block->layer_norm_attn, &input[pos * d_model], &d_normed1[pos * d_model], &d_input_ln[pos * d_model], &grads->layer_norm_attn, d_model);
     }
+    for (int i = 0; i < vector_size; i++) d_input[i] = d_input_residual[i] + d_input_ln[i];
 
     free(normed1); free(attn_out); free(after_attn);
-    free(normed2); free(ff_out); free(normed3);
-    free(d_after_ff); free(d_attn_out); free(d_ff_out);
-    free(d_after_attn); free(d_normed2); free(d_after_attn_ln); free(d_normed1);
+    free(normed2); free(ff_out);
+    free(d_after_attn); free(d_ff_out); free(d_normed2); free(d_after_attn_ln);
+    free(d_attn_out); free(d_input_residual); free(d_normed1); free(d_input_ln);
 }
 
 /*
@@ -882,12 +868,11 @@ void transformer_backward(
         d_hidden = d_layer_input;
     }
 
-    /* Gradients for token embeddings and positional embeddings */
+    /* Gradients for token embeddings (positional embeddings are fixed, not updated) */
     for (int pos = 0; pos < sequence_length; pos++) {
         int token = input_tokens[pos];
         for (int dim = 0; dim < d_model; dim++) {
             grads->token_embeddings.data[token * d_model + dim] += d_hidden[pos * d_model + dim];
-            grads->positional_embeddings.data[pos * d_model + dim] += d_hidden[pos * d_model + dim];
         }
     }
 
@@ -949,6 +934,20 @@ int main(void) {
 
     Transformer model;
     transformer_init(&model, config);
+
+    /* Reinitialize weights with Xavier/Glorot for diverse gradient flow during training */
+    matrix_init_xavier(&model.token_embeddings);
+    matrix_init_xavier(&model.lm_head);
+    for (int l = 0; l < config.num_layers; l++) {
+        for (int h = 0; h < config.num_heads; h++) {
+            matrix_init_xavier(&model.blocks[l].self_attention.heads[h].weight_query);
+            matrix_init_xavier(&model.blocks[l].self_attention.heads[h].weight_key);
+            matrix_init_xavier(&model.blocks[l].self_attention.heads[h].weight_value);
+        }
+        matrix_init_xavier(&model.blocks[l].self_attention.weight_output);
+        matrix_init_xavier(&model.blocks[l].feed_forward.weight_up);
+        matrix_init_xavier(&model.blocks[l].feed_forward.weight_down);
+    }
 
     /* Initialize gradients */
     TransformerGrads grads;
