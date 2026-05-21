@@ -120,12 +120,6 @@ void grad_zero_matrix(Matrix *grad) {
     matrix_zero(grad);
 }
 
-void grad_add_scaled(Matrix *grad, const float *values, float scale, int size) {
-    for (int i = 0; i < size; i++) {
-        grad->data[i] += values[i] * scale;
-    }
-}
-
 void grad_init_layernorm(LayerNormGrads *grad, int size) {
     grad->size = size;
     grad->gamma = (float *)calloc(size, sizeof(float));
@@ -575,6 +569,33 @@ void multihead_attention_backward(
             }
         }
 
+        /* Gradient for d_input through Q and K: d_input += (d_Q @ W_Q^T + d_K @ W_K^T) */
+        for (int row = 0; row < sequence_length; row++) {
+            for (int dim = 0; dim < d_model; dim++) {
+                float dq_sum = 0.0f, dk_sum = 0.0f;
+                for (int hd = 0; hd < head_dim; hd++) {
+                    dq_sum += d_Q[row * head_dim + hd] * attention->heads[h].weight_query.data[dim * head_dim + hd];
+                    dk_sum += d_K[row * head_dim + hd] * attention->heads[h].weight_key.data[dim * head_dim + hd];
+                }
+                d_input[row * d_model + dim] += dq_sum + dk_sum;
+            }
+        }
+
+        /* Gradient for d_input through V: d_input += d_V @ W_V^T */
+        for (int col = 0; col < sequence_length; col++) {
+            for (int dim = 0; dim < d_model; dim++) {
+                float dv_sum = 0.0f;
+                for (int hd = 0; hd < head_dim; hd++) {
+                    float dv = 0.0f;
+                    for (int row = 0; row < sequence_length; row++) {
+                        dv += attention_scores[row * sequence_length + col] * d_head_out[row * head_dim + hd];
+                    }
+                    dv_sum += dv * attention->heads[h].weight_value.data[dim * head_dim + hd];
+                }
+                d_input[col * d_model + dim] += dv_sum;
+            }
+        }
+
         free(attention_scores);
         free(head_out);
         free(d_head_out);
@@ -992,9 +1013,7 @@ int main(void) {
             free(logits);
         }
 
-        /* Average gradients */
-        int total_params = 0;
-        /* (simplified: just scale by 1/num_batches) */
+        /* Average gradients by number of batches */
         float inv_batches = 1.0f / num_batches;
 
         /* SGD step */
