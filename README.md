@@ -41,11 +41,10 @@ Input Tokens → Token Embedding + Positional Encoding
              → Logits → Softmax → Sampled Token
 ```
 
-Each Transformer Block:
+Each Transformer Block (pre-norm):
 ```
 Input → LayerNorm → Multi-Head Self-Attention → Residual Add
-      → LayerNorm → Feed-Forward Network      → Residual Add
-      → LayerNorm → Output
+      → LayerNorm → Feed-Forward Network      → Residual Add → Output
 ```
 
 ### Forward Pass Sequence
@@ -93,10 +92,6 @@ sequenceDiagram
         
         FFN-->>Block: ff_output
         Block->>Block: Residual Add (x + ff_output)
-        
-        Note over Block: Final Normalization
-        Block->>LN: layernorm_forward(output)
-        LN-->>Block: block_output
         Block-->>Model: block_output
     end
     
@@ -119,6 +114,7 @@ sequenceDiagram
 | `transformer.h` | Single-header library (stb-style). Contains all declarations and implementations |
 | `main.c` | Inference demo with vocabulary mapping and component visualization |
 | `train.c` | Character-level training loop with full backpropagation |
+| `predict.c` | Interactive text generator using saved trained weights |
 
 ## Quick Start
 
@@ -146,7 +142,16 @@ gcc -o train train.c -lm -O2
 ./train
 ```
 
-Trains a tiny character-level model (d_model=16, 2 heads, 1 layer) on a short text sample and generates text every 50 epochs.
+Trains a tiny character-level model (d_model=16, 2 heads, 1 layer) on a short text sample, generates text every 50 epochs, and saves the trained weights to `weights.bin`.
+
+### Interactive Text Generation
+
+```bash
+gcc -o predict predict.c -lm -O2
+./predict
+```
+
+Loads `weights.bin` and provides an interactive prompt for text generation. Type lowercase text at the prompt and see the model continue it.
 
 ## Using the Library
 
@@ -193,6 +198,18 @@ free(logits);
 transformer_free(&model);
 ```
 
+### Save / Load
+
+```c
+// Save trained weights
+transformer_save(&model, "weights.bin");
+
+// Load saved weights (model must be initialized with matching config)
+transformer_load(&model, "weights.bin");
+```
+
+Uses a compact binary format with magic header (`TMFM`) and config validation on load.
+
 ## Configuration
 
 | Parameter | Description | Typical Value |
@@ -208,7 +225,7 @@ transformer_free(&model);
 
 - **Single header** - no build system needed, just `#include`
 - **No external dependencies** - only standard C library (`stdio.h`, `stdlib.h`, `math.h`, `string.h`)
-- **Deterministic testing** - `matrix_init_fixed()` for reproducible outputs
+- **Save and load trained weights** - binary format with config validation
 - **Xavier initialization** - proper weight scaling for training
 - **Numerically stable softmax** - max-subtraction prevents overflow
 - **Per-position layer normalization** - correct normalization over feature dimension only
