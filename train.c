@@ -29,7 +29,7 @@
 #define CHAR_D_FF 32
 #define CHAR_MAX_SEQ_LEN 16
 #define LEARNING_RATE 0.01f
-#define NUM_EPOCHS 500
+#define NUM_EPOCHS 5000
 #define EVAL_EVERY 50
 
 /* Character vocabulary: a-z (0-25), space (26), newline (27) */
@@ -1029,6 +1029,13 @@ int main(void) {
             int prompt[] = {char_to_id('t'), char_to_id('h'), char_to_id('e'), char_to_id(' ')};
             generate_text(&model, prompt, 4, 20);
         }
+    }
+
+    /* Save trained weights */
+    if (transformer_save(&model, "weights.bin") == 0) {
+        printf("Weights saved to weights.bin\n");
+    } else {
+        printf("Failed to save weights!\n");
     }
 
     /* Cleanup */

@@ -415,6 +415,16 @@ void transformer_forward(
     int sequence_length
 );
 
+/* Save trained model weights to a binary file.
+ * Writes a header with the config followed by all weight data.
+ * Returns 0 on success, -1 on error. */
+int transformer_save(const Transformer *model, const char *filepath);
+
+/* Load trained model weights from a binary file.
+ * Model must already be initialized with a matching TransformerConfig.
+ * Returns 0 on success, -1 on error. */
+int transformer_load(Transformer *model, const char *filepath);
+
 /* Sample a token ID from the logits distribution using temperature scaling.
  *
  *  temperature > 1.0: More random/diverse output
@@ -1079,6 +1089,129 @@ int transformer_sample(const float *logits, int vocab_size, float temperature) {
 
     free(probabilities);
     return sampled_token;
+}
+
+/* ---- Save / Load ---- */
+
+#define TRANSFORMER_MAGIC "TMFM"
+
+static int fwrite_matrix(FILE *f, const Matrix *m) {
+    size_t n = (size_t)m->rows * m->cols;
+    return fwrite(m->data, sizeof(float), n, f) == n ? 0 : -1;
+}
+
+static int fread_matrix(FILE *f, Matrix *m) {
+    size_t n = (size_t)m->rows * m->cols;
+    return fread(m->data, sizeof(float), n, f) == n ? 0 : -1;
+}
+
+static int fwrite_floats(FILE *f, const float *data, int n) {
+    return fwrite(data, sizeof(float), (size_t)n, f) == (size_t)n ? 0 : -1;
+}
+
+static int fread_floats(FILE *f, float *data, int n) {
+    return fread(data, sizeof(float), (size_t)n, f) == (size_t)n ? 0 : -1;
+}
+
+int transformer_save(const Transformer *model, const char *filepath) {
+    FILE *f = fopen(filepath, "wb");
+    if (!f) return -1;
+
+    TransformerConfig cfg = model->config;
+
+    /* Write header */
+    fwrite(TRANSFORMER_MAGIC, 1, 4, f);
+    fwrite(&cfg.vocab_size, sizeof(int), 1, f);
+    fwrite(&cfg.d_model, sizeof(int), 1, f);
+    fwrite(&cfg.num_heads, sizeof(int), 1, f);
+    fwrite(&cfg.num_layers, sizeof(int), 1, f);
+    fwrite(&cfg.d_ff, sizeof(int), 1, f);
+    fwrite(&cfg.max_seq_len, sizeof(int), 1, f);
+
+    /* Token and positional embeddings */
+    fwrite_matrix(f, &model->token_embeddings);
+    fwrite_matrix(f, &model->positional_embeddings);
+
+    /* Transformer blocks */
+    for (int l = 0; l < cfg.num_layers; l++) {
+        for (int h = 0; h < cfg.num_heads; h++) {
+            fwrite_matrix(f, &model->blocks[l].self_attention.heads[h].weight_query);
+            fwrite_matrix(f, &model->blocks[l].self_attention.heads[h].weight_key);
+            fwrite_matrix(f, &model->blocks[l].self_attention.heads[h].weight_value);
+        }
+        fwrite_matrix(f, &model->blocks[l].self_attention.weight_output);
+        fwrite_matrix(f, &model->blocks[l].feed_forward.weight_up);
+        fwrite_floats(f, model->blocks[l].feed_forward.bias_up.data, cfg.d_ff);
+        fwrite_matrix(f, &model->blocks[l].feed_forward.weight_down);
+        fwrite_floats(f, model->blocks[l].feed_forward.bias_down.data, cfg.d_model);
+        fwrite_floats(f, model->blocks[l].layer_norm_attn.gamma, cfg.d_model);
+        fwrite_floats(f, model->blocks[l].layer_norm_attn.beta, cfg.d_model);
+        fwrite_floats(f, model->blocks[l].layer_norm_ff.gamma, cfg.d_model);
+        fwrite_floats(f, model->blocks[l].layer_norm_ff.beta, cfg.d_model);
+    }
+
+    /* Final layer norm and LM head */
+    fwrite_floats(f, model->final_ln_gamma.data, cfg.d_model);
+    fwrite_floats(f, model->final_ln_beta.data, cfg.d_model);
+    fwrite_matrix(f, &model->lm_head);
+
+    fclose(f);
+    return 0;
+}
+
+int transformer_load(Transformer *model, const char *filepath) {
+    FILE *f = fopen(filepath, "rb");
+    if (!f) return -1;
+
+    TransformerConfig cfg = model->config;
+
+    /* Read and verify header */
+    char magic[4];
+    int vcb, dm, nh, nl, df, msl;
+    fread(magic, 1, 4, f);
+    fread(&vcb, sizeof(int), 1, f);
+    fread(&dm, sizeof(int), 1, f);
+    fread(&nh, sizeof(int), 1, f);
+    fread(&nl, sizeof(int), 1, f);
+    fread(&df, sizeof(int), 1, f);
+    fread(&msl, sizeof(int), 1, f);
+
+    if (memcmp(magic, TRANSFORMER_MAGIC, 4) != 0 ||
+        vcb != cfg.vocab_size || dm != cfg.d_model || nh != cfg.num_heads ||
+        nl != cfg.num_layers || df != cfg.d_ff || msl != cfg.max_seq_len) {
+        fclose(f);
+        return -1;
+    }
+
+    /* Token and positional embeddings */
+    fread_matrix(f, &model->token_embeddings);
+    fread_matrix(f, &model->positional_embeddings);
+
+    /* Transformer blocks */
+    for (int l = 0; l < cfg.num_layers; l++) {
+        for (int h = 0; h < cfg.num_heads; h++) {
+            fread_matrix(f, &model->blocks[l].self_attention.heads[h].weight_query);
+            fread_matrix(f, &model->blocks[l].self_attention.heads[h].weight_key);
+            fread_matrix(f, &model->blocks[l].self_attention.heads[h].weight_value);
+        }
+        fread_matrix(f, &model->blocks[l].self_attention.weight_output);
+        fread_matrix(f, &model->blocks[l].feed_forward.weight_up);
+        fread_floats(f, model->blocks[l].feed_forward.bias_up.data, cfg.d_ff);
+        fread_matrix(f, &model->blocks[l].feed_forward.weight_down);
+        fread_floats(f, model->blocks[l].feed_forward.bias_down.data, cfg.d_model);
+        fread_floats(f, model->blocks[l].layer_norm_attn.gamma, cfg.d_model);
+        fread_floats(f, model->blocks[l].layer_norm_attn.beta, cfg.d_model);
+        fread_floats(f, model->blocks[l].layer_norm_ff.gamma, cfg.d_model);
+        fread_floats(f, model->blocks[l].layer_norm_ff.beta, cfg.d_model);
+    }
+
+    /* Final layer norm and LM head */
+    fread_floats(f, model->final_ln_gamma.data, cfg.d_model);
+    fread_floats(f, model->final_ln_beta.data, cfg.d_model);
+    fread_matrix(f, &model->lm_head);
+
+    fclose(f);
+    return 0;
 }
 
 #endif /* TRANSFORMER_IMPLEMENTATION */
